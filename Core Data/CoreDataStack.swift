@@ -15,6 +15,8 @@ struct CoreDataStack {
     private let coordinator : NSPersistentStoreCoordinator
     private let modelURL : NSURL
     private let dbURL : NSURL
+    private let persistingContext: NSManagedObjectContext
+    private let backgroundContext: NSManagedObjectContext
     let context : NSManagedObjectContext
     
     // MARK:  - Initializers
@@ -34,11 +36,20 @@ struct CoreDataStack {
         }
         self.model = model
         
+        
+        
         // Create the store coordinator
         coordinator = NSPersistentStoreCoordinator(managedObjectModel: model)
+        
         // create a context and add connect it to the coordinator
+        persistingContext = NSManagedObjectContext(concurrencyType: .PrivateQueueConcurrencyType)
+        persistingContext.persistentStoreCoordinator = coordinator
+        
         context = NSManagedObjectContext(concurrencyType: .MainQueueConcurrencyType)
-        context.persistentStoreCoordinator = coordinator
+        context.parentContext = persistingContext
+        
+        backgroundContext = NSManagedObjectContext(concurrencyType: .PrivateQueueConcurrencyType)
+        backgroundContext.parentContext = context
         
         // Add a SQLite store located in the documents folder
         let fm = NSFileManager.defaultManager()
@@ -49,8 +60,12 @@ struct CoreDataStack {
         }
         
         self.dbURL = docUrl.URLByAppendingPathComponent("model.sqlite")
+        
+        //migration options
         do{
-            try addStoreCoordinator(NSSQLiteStoreType, configuration: nil, storeURL: dbURL, options: nil)
+            let options = [NSInferMappingModelAutomaticallyOption: true,
+                           NSMigratePersistentStoresAutomaticallyOption: true]
+            try addStoreCoordinator(NSSQLiteStoreType, configuration: nil, storeURL: dbURL, options: options)
             
         }catch{
             print("unable to add store at \(dbURL)")
@@ -63,7 +78,7 @@ struct CoreDataStack {
                              storeURL: NSURL,
                              options : [NSObject : AnyObject]?) throws{
         
-        try coordinator.addPersistentStoreWithType(NSSQLiteStoreType, configuration: nil, URL: dbURL, options: nil)
+        try coordinator.addPersistentStoreWithType(NSSQLiteStoreType, configuration: configuration, URL: dbURL, options: options)
         
     }
 }
@@ -78,28 +93,52 @@ extension CoreDataStack  {
         try coordinator.destroyPersistentStoreAtURL(dbURL, withType:NSSQLiteStoreType , options: nil)
         
         try addStoreCoordinator(NSSQLiteStoreType, configuration: nil, storeURL: dbURL, options: nil)
+        
+        
+    }
+}
+
+// MARK:  - Batch processing in the background
+extension CoreDataStack{
+    typealias Batch = (workerContext: NSManagedObjectContext) -> Void
+    func performBackgroundBatchOperation(batch: Batch){
+        backgroundContext.performBlock {
+            batch(workerContext: self.backgroundContext)
+            do {
+                try self.backgroundContext.save()
+            } catch {
+                fatalError("Error while saving backgroundContext: \(error)")
+            }
+        }
     }
 }
 
 // MARK:  - Save
 extension CoreDataStack {
     
-    func saveContext() throws{
-        if context.hasChanges {
-            try context.save()
+    func saveContext() {
+        context.performBlockAndWait {
+            do {
+                try self.context.save()
+            } catch {
+                fatalError("Error while saving main context: \(error)")
+            }
+            
+            self.persistingContext.performBlock({
+                do {
+                    try self.persistingContext.save()
+                } catch {
+                    fatalError("Error while saving main context: \(error)")
+                }
+            })
         }
     }
     
     func autoSave(delayInSeconds : Int){
         
         if delayInSeconds > 0 {
-            do{
-                try saveContext()
-                print("Autosaving")
-            }catch{
-                print("Error while autosaving")
-            }
-            
+            print("Autosaving")
+            saveContext()
             
             let delayInNanoSeconds = UInt64(delayInSeconds) * NSEC_PER_SEC
             let time = dispatch_time(DISPATCH_TIME_NOW, Int64(delayInNanoSeconds))
@@ -107,7 +146,6 @@ extension CoreDataStack {
             dispatch_after(time, dispatch_get_main_queue(), {
                 self.autoSave(delayInSeconds)
             })
-            
         }
     }
 }
